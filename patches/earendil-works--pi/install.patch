@@ -1,0 +1,12 @@
+diff --git a/package.json b/package.json
+index 072c908a..7c6c6a79 100644
+--- a/package.json
++++ b/package.json
+@@ -12,6 +12,7 @@
+ 	"scripts": {
+ 		"clean": "npm run clean --workspaces",
+ 		"build": "cd packages/tui && npm run build && cd ../ai && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build",
++    "install": "ln -sf $PWD/packages/coding-agent/dist/cli.js /usr/local/bin/pi",
+ 		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:ts-imports && npm run check:shrinkwrap && tsgo --noEmit && npm run check:browser-smoke",
+ 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
+ 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",

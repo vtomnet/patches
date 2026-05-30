@@ -1,0 +1,178 @@
+diff --git a/packages/agent/src/agent-loop.ts b/packages/agent/src/agent-loop.ts
+index 28f037f5..fe3aa081 100644
+--- a/packages/agent/src/agent-loop.ts
++++ b/packages/agent/src/agent-loop.ts
+@@ -71,8 +71,9 @@ export function agentLoopContinue(
+ 		throw new Error("Cannot continue: no messages in context");
+ 	}
+ 
+-	if (context.messages[context.messages.length - 1].role === "assistant") {
+-		throw new Error("Cannot continue from message role: assistant");
++	const lastMessage = context.messages[context.messages.length - 1];
++	if (lastMessage.role === "assistant" && !hasToolCalls(lastMessage)) {
++		throw new Error("Cannot continue from assistant message without tool calls");
+ 	}
+ 
+ 	const stream = createAgentStream();
+@@ -128,20 +129,26 @@ export async function runAgentLoopContinue(
+ 		throw new Error("Cannot continue: no messages in context");
+ 	}
+ 
+-	if (context.messages[context.messages.length - 1].role === "assistant") {
+-		throw new Error("Cannot continue from message role: assistant");
++	const lastMessage = context.messages[context.messages.length - 1];
++	if (lastMessage.role === "assistant" && !hasToolCalls(lastMessage)) {
++		throw new Error("Cannot continue from assistant message without tool calls");
+ 	}
+ 
+ 	const newMessages: AgentMessage[] = [];
+ 	const currentContext: AgentContext = { ...context };
++	const resumeAssistant = lastMessage.role === "assistant" ? lastMessage : undefined;
+ 
+ 	await emit({ type: "agent_start" });
+ 	await emit({ type: "turn_start" });
+ 
+-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn);
++	await runLoop(currentContext, newMessages, config, signal, emit, streamFn, resumeAssistant);
+ 	return newMessages;
+ }
+ 
++function hasToolCalls(message: AssistantMessage): boolean {
++	return message.content.some((content) => content.type === "toolCall");
++}
++
+ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
+ 	return new EventStream<AgentEvent, AgentMessage[]>(
+ 		(event: AgentEvent) => event.type === "agent_end",
+@@ -159,6 +166,7 @@ async function runLoop(
+ 	signal: AbortSignal | undefined,
+ 	emit: AgentEventSink,
+ 	streamFn?: StreamFn,
++	resumeAssistant?: AssistantMessage,
+ ): Promise<void> {
+ 	let currentContext = initialContext;
+ 	let config = initialConfig;
+@@ -189,14 +197,19 @@ async function runLoop(
+ 				pendingMessages = [];
+ 			}
+ 
+-			// Stream assistant response
+-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+-			newMessages.push(message);
++			// Stream assistant response, unless continuing from an existing assistant tool-call message.
++			const message =
++				resumeAssistant ?? (await streamAssistantResponse(currentContext, config, signal, emit, streamFn));
++			if (resumeAssistant) {
++				resumeAssistant = undefined;
++			} else {
++				newMessages.push(message);
+ 
+-			if (message.stopReason === "error" || message.stopReason === "aborted") {
+-				await emit({ type: "turn_end", message, toolResults: [] });
+-				await emit({ type: "agent_end", messages: newMessages });
+-				return;
++				if (message.stopReason === "error" || message.stopReason === "aborted") {
++					await emit({ type: "turn_end", message, toolResults: [] });
++					await emit({ type: "agent_end", messages: newMessages });
++					return;
++				}
+ 			}
+ 
+ 			// Check for tool calls
+diff --git a/packages/agent/src/agent.ts b/packages/agent/src/agent.ts
+index db6684a8..99090bad 100644
+--- a/packages/agent/src/agent.ts
++++ b/packages/agent/src/agent.ts
+@@ -345,7 +345,7 @@ export class Agent {
+ 			throw new Error("No messages to continue from");
+ 		}
+ 
+-		if (lastMessage.role === "assistant") {
++		if (lastMessage.role === "assistant" && !lastMessage.content.some((content) => content.type === "toolCall")) {
+ 			const queuedSteering = this.steeringQueue.drain();
+ 			if (queuedSteering.length > 0) {
+ 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
+@@ -358,7 +358,7 @@ export class Agent {
+ 				return;
+ 			}
+ 
+-			throw new Error("Cannot continue from message role: assistant");
++			throw new Error("Cannot continue from assistant message without tool calls");
+ 		}
+ 
+ 		await this.runContinuation();
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+index 608a6153..45bed9fc 100644
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -941,6 +941,23 @@ export class AgentSession {
+ 		}
+ 	}
+ 
++	async continueFromCurrentPoint(): Promise<void> {
++		if (!this.model) {
++			throw new Error(formatNoModelSelectedMessage());
++		}
++		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
++			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
++		}
++		try {
++			await this.agent.continue();
++			while (await this._handlePostAgentRun()) {
++				await this.agent.continue();
++			}
++		} finally {
++			this._flushPendingBashMessages();
++		}
++	}
++
+ 	private async _handlePostAgentRun(): Promise<boolean> {
+ 		const msg = this._lastAssistantMessage;
+ 		this._lastAssistantMessage = undefined;
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 987a62cb..3f2cc441 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -4333,12 +4333,14 @@ export class InteractiveMode {
+ 					// Loop until user makes a complete choice or cancels to tree
+ 					let wantsSummary = false;
+ 					let customInstructions: string | undefined;
++					let continueAfterNavigation = false;
+ 
+ 					// Check if we should skip the prompt (user preference to always default to no summary)
+ 					if (!this.settingsManager.getBranchSummarySkipPrompt()) {
+ 						while (true) {
+ 							const summaryChoice = await this.showExtensionSelector("Summarize branch?", [
+ 								"No summary",
++								"No summary and continue",
+ 								"Summarize",
+ 								"Summarize with custom prompt",
+ 							]);
+@@ -4349,7 +4351,8 @@ export class InteractiveMode {
+ 								return;
+ 							}
+ 
+-							wantsSummary = summaryChoice !== "No summary";
++							wantsSummary = summaryChoice === "Summarize" || summaryChoice === "Summarize with custom prompt";
++							continueAfterNavigation = summaryChoice === "No summary and continue";
+ 
+ 							if (summaryChoice === "Summarize with custom prompt") {
+ 								customInstructions = await this.showExtensionEditor("Custom summarization instructions");
+@@ -4403,10 +4406,15 @@ export class InteractiveMode {
+ 						// Update UI
+ 						this.chatContainer.clear();
+ 						this.renderInitialMessages();
+-						if (result.editorText && !this.editor.getText().trim()) {
++						if (!continueAfterNavigation && result.editorText && !this.editor.getText().trim()) {
+ 							this.editor.setText(result.editorText);
+ 						}
+-						this.showStatus("Navigated to selected point");
++						this.showStatus(
++							continueAfterNavigation ? "Continuing from selected point" : "Navigated to selected point",
++						);
++						if (continueAfterNavigation) {
++							await this.session.continueFromCurrentPoint();
++						}
+ 						void this.flushCompactionQueue({ willRetry: false });
+ 					} catch (error) {
+ 						this.showError(error instanceof Error ? error.message : String(error));
