@@ -1,0 +1,116 @@
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index b874495b..beae4cf5 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -1050,16 +1050,55 @@ export class InteractiveMode {
+ 
+ 	private getCompactDisplayPathSegments(resourcePath: string): string[] {
+ 		return this.formatDisplayPath(resourcePath)
+ 			.replace(/\\/g, "/")
+ 			.split("/")
+ 			.filter((segment) => segment.length > 0 && segment !== "~");
+ 	}
+ 
++	private getLocalExtensionManifestRootPath(resourcePath: string, sourceInfo?: SourceInfo): string | undefined {
++		if (this.isPackageSource(sourceInfo)) return undefined;
++
++		const normalizedResourcePath = path.resolve(resourcePath);
++		const baseDir = sourceInfo?.baseDir ? path.resolve(sourceInfo.baseDir) : undefined;
++		let currentDir = path.dirname(normalizedResourcePath);
++
++		for (;;) {
++			const packageJsonPath = path.join(currentDir, "package.json");
++			if (fs.existsSync(packageJsonPath)) {
++				try {
++					const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8")) as {
++						pi?: { extensions?: unknown };
++					};
++					const extensionEntries = pkg.pi?.extensions;
++					if (Array.isArray(extensionEntries)) {
++						for (const entry of extensionEntries) {
++							if (typeof entry !== "string") continue;
++							const resolvedEntry = path.resolve(currentDir, entry);
++							if (
++								normalizedResourcePath === resolvedEntry ||
++								normalizedResourcePath.startsWith(`${resolvedEntry}${path.sep}`)
++							) {
++								return currentDir;
++							}
++						}
++					}
++				} catch {
++					return undefined;
++				}
++			}
++
++			if (baseDir && currentDir === baseDir) return undefined;
++			const parentDir = path.dirname(currentDir);
++			if (parentDir === currentDir) return undefined;
++			currentDir = parentDir;
++		}
++	}
++
+ 	private getCompactNonPackageExtensionLabel(
+ 		resourcePath: string,
+ 		index: number,
+ 		allPaths: Array<{ path: string; segments: string[] }>,
+ 	): string {
+ 		const segments = allPaths[index]?.segments;
+ 		if (!segments || segments.length === 0) {
+ 			return this.getCompactPathLabel(resourcePath);
+@@ -1078,22 +1117,51 @@ export class InteractiveMode {
+ 				return candidate;
+ 			}
+ 		}
+ 
+ 		return segments.join("/");
+ 	}
+ 
+ 	private getCompactExtensionLabels(extensions: Array<{ path: string; sourceInfo?: SourceInfo }>): string[] {
++		const manifestRoots = new Map<string, string>();
++		const manifestRootCounts = new Map<string, number>();
++		for (const extension of extensions) {
++			const manifestRoot = this.getLocalExtensionManifestRootPath(extension.path, extension.sourceInfo);
++			if (!manifestRoot) continue;
++			manifestRoots.set(extension.path, manifestRoot);
++			manifestRootCounts.set(manifestRoot, (manifestRootCounts.get(manifestRoot) ?? 0) + 1);
++		}
++
+ 		const nonPackageExtensions = extensions
+ 			.map((extension) => {
+-				const segments = this.getCompactDisplayPathSegments(extension.path);
+-				const lastSegment = segments[segments.length - 1];
+-				if (segments.length > 1 && (lastSegment === "index.ts" || lastSegment === "index.js")) {
+-					segments.pop();
++				const manifestRoot = manifestRoots.get(extension.path);
++				const segments = this.getCompactDisplayPathSegments(manifestRoot ?? extension.path);
++				if (manifestRoot) {
++					const count = manifestRootCounts.get(manifestRoot) ?? 0;
++					if (count > 1) {
++						const relativeSegments = path
++							.relative(manifestRoot, extension.path)
++							.replace(/\\/g, "/")
++							.split("/")
++							.filter((segment) => segment.length > 0);
++						const lastRelativeSegment = relativeSegments[relativeSegments.length - 1];
++						if (
++							relativeSegments.length > 1 &&
++							(lastRelativeSegment === "index.ts" || lastRelativeSegment === "index.js")
++						) {
++							relativeSegments.pop();
++						}
++						segments.push(...relativeSegments);
++					}
++				} else {
++					const lastSegment = segments[segments.length - 1];
++					if (segments.length > 1 && (lastSegment === "index.ts" || lastSegment === "index.js")) {
++						segments.pop();
++					}
+ 				}
+ 				return {
+ 					path: extension.path,
+ 					sourceInfo: extension.sourceInfo,
+ 					segments,
+ 				};
+ 			})
+ 			.filter((extension) => !this.isPackageSource(extension.sourceInfo));

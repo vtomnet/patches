@@ -1,0 +1,278 @@
+diff --git a/packages/coding-agent/src/core/session-manager.ts b/packages/coding-agent/src/core/session-manager.ts
+index c2bae164..7e77ec5b 100644
+--- a/packages/coding-agent/src/core/session-manager.ts
++++ b/packages/coding-agent/src/core/session-manager.ts
+@@ -669,10 +669,185 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+ export type SessionListProgress = (loaded: number, total: number) => void;
+ 
+ const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
++const MAX_CONCURRENT_FAST_SESSION_INFO_LOADS = 8;
++const FAST_SESSION_INFO_READ_BYTES = 16 * 1024;
++
++type SessionInfoLoader = (filePath: string) => Promise<SessionInfo | null>;
++
++function readFileSlice(filePath: string, position: number, length: number): string {
++	const fd = openSync(filePath, "r");
++	try {
++		const buffer = Buffer.allocUnsafe(length);
++		const bytesRead = readSync(fd, buffer, 0, length, position);
++		return buffer.toString("utf8", 0, bytesRead);
++	} finally {
++		closeSync(fd);
++	}
++}
++
++function completeLines(chunk: string, options: { dropFirst: boolean; dropLast: boolean }): string[] {
++	const lines = chunk.split("\n");
++	if (options.dropFirst) lines.shift();
++	if (options.dropLast && !chunk.endsWith("\n")) lines.pop();
++	return lines;
++}
++
++interface ShallowSessionInfo {
++	id: string;
++	cwd: string;
++	name?: string;
++	parentSessionPath?: string;
++	created: Date;
++	modified: Date;
++	messageCount: number;
++	firstMessage: string;
++}
++
++function scanSessionInfoLines(
++	lines: string[],
++	options: { requireHeader: boolean },
++): {
++	header: SessionHeader | null;
++	name: string | undefined;
++	messageCount: number;
++	firstMessage: string;
++	lastActivityTime: number | undefined;
++} {
++	let header: SessionHeader | null = null;
++	let sawHeader = !options.requireHeader;
++	let name: string | undefined;
++	let messageCount = 0;
++	let firstMessage = "";
++	let lastActivityTime: number | undefined;
++
++	for (const line of lines) {
++		const entry = parseSessionEntryLine(line);
++		if (!entry) continue;
++		if (entry.type === "session") {
++			header = entry;
++			sawHeader = true;
++			continue;
++		}
++		if (!sawHeader) continue;
++
++		if (entry.type === "session_info") {
++			name = entry.name?.trim() || undefined;
++			continue;
++		}
++
++		if (entry.type !== "message") continue;
++		messageCount++;
++
++		const activityTime = getMessageActivityTime(entry);
++		if (typeof activityTime === "number") {
++			lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
++		}
++
++		if (firstMessage) continue;
++		const message = entry.message;
++		if (!isMessageWithContent(message) || message.role !== "user") continue;
++		const textContent = extractTextContent(message);
++		if (textContent) firstMessage = textContent;
++	}
++
++	return { header, name, messageCount, firstMessage, lastActivityTime };
++}
++
++function readShallowSessionInfo(
++	filePath: string,
++	stats: { size: number; mtime: Date; mtimeMs: number },
++): ShallowSessionInfo | null {
++	const prefixLength = Math.min(FAST_SESSION_INFO_READ_BYTES, stats.size);
++	const prefix = readFileSlice(filePath, 0, prefixLength);
++	const wholeFile = prefixLength === stats.size;
++	const prefixScan = scanSessionInfoLines(completeLines(prefix, { dropFirst: false, dropLast: !wholeFile }), {
++		requireHeader: true,
++	});
++	if (!prefixScan.header) return null;
++
++	let name = prefixScan.name;
++	let messageCount = wholeFile ? prefixScan.messageCount : -1;
++	let firstMessage = prefixScan.firstMessage;
++	let lastActivityTime = prefixScan.lastActivityTime;
++
++	if (!wholeFile) {
++		const tailLength = Math.min(FAST_SESSION_INFO_READ_BYTES, stats.size);
++		const tailStart = Math.max(0, stats.size - tailLength);
++		if (tailStart > 0) {
++			const tail = readFileSlice(filePath, tailStart, tailLength);
++			const tailScan = scanSessionInfoLines(completeLines(tail, { dropFirst: tailStart > 0, dropLast: false }), {
++				requireHeader: false,
++			});
++			name = tailScan.name ?? name;
++			lastActivityTime = Math.max(lastActivityTime ?? 0, tailScan.lastActivityTime ?? 0) || undefined;
++		}
++	}
++
++	const header = prefixScan.header;
++	const cwd = typeof header.cwd === "string" ? header.cwd : "";
++	const headerTime = typeof header.timestamp === "string" ? new Date(header.timestamp).getTime() : NaN;
++	const modified =
++		typeof lastActivityTime === "number" && lastActivityTime > 0
++			? new Date(lastActivityTime)
++			: stats.mtime.getTime() > 0
++				? stats.mtime
++				: !Number.isNaN(headerTime)
++					? new Date(headerTime)
++					: new Date();
++
++	return {
++		id: header.id,
++		cwd,
++		name,
++		parentSessionPath: header.parentSession,
++		created: !Number.isNaN(headerTime) ? new Date(headerTime) : stats.mtime,
++		modified,
++		messageCount,
++		firstMessage: firstMessage || "(no messages)",
++	};
++}
++
++function readSessionAllMessagesText(filePath: string): string {
++	const allMessages: string[] = [];
++	for (const entry of loadEntriesFromFile(filePath)) {
++		if (entry.type !== "message") continue;
++		const message = entry.message;
++		if (!isMessageWithContent(message)) continue;
++		if (message.role !== "user" && message.role !== "assistant") continue;
++		const textContent = extractTextContent(message);
++		if (textContent) allMessages.push(textContent);
++	}
++	return allMessages.join(" ");
++}
++
++function makeLazySessionInfo(info: Omit<SessionInfo, "allMessagesText">): SessionInfo {
++	let loaded = false;
++	let allMessagesText = "";
++	return Object.defineProperty(info, "allMessagesText", {
++		enumerable: true,
++		configurable: true,
++		get() {
++			if (!loaded) {
++				allMessagesText = readSessionAllMessagesText(info.path);
++				loaded = true;
++			}
++			return allMessagesText;
++		},
++	}) as SessionInfo;
++}
++
++async function buildFastSessionInfo(filePath: string): Promise<SessionInfo | null> {
++	const stats = await stat(filePath);
++	const info = readShallowSessionInfo(filePath, stats);
++	if (!info) return null;
++	return makeLazySessionInfo({ path: filePath, ...info });
++}
+ 
+ async function buildSessionInfosWithConcurrency(
+ 	files: string[],
+ 	onLoaded: () => void,
++	loader: SessionInfoLoader = buildSessionInfo,
++	maxConcurrency = MAX_CONCURRENT_SESSION_INFO_LOADS,
+ ): Promise<(SessionInfo | null)[]> {
+ 	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
+ 	const inFlight = new Set<Promise<void>>();
+@@ -684,7 +859,7 @@ async function buildSessionInfosWithConcurrency(
+ 		if (!file) return;
+ 
+ 		let task: Promise<void>;
+-		task = buildSessionInfo(file)
++		task = loader(file)
+ 			.then((info) => {
+ 				results[index] = info;
+ 			})
+@@ -699,7 +874,7 @@ async function buildSessionInfosWithConcurrency(
+ 	};
+ 
+ 	while (nextIndex < files.length || inFlight.size > 0) {
+-		while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
++		while (nextIndex < files.length && inFlight.size < maxConcurrency) {
+ 			startNext();
+ 		}
+ 		if (inFlight.size > 0) {
+@@ -715,6 +890,7 @@ async function listSessionsFromDir(
+ 	onProgress?: SessionListProgress,
+ 	progressOffset = 0,
+ 	progressTotal?: number,
++	mode: "full" | "fast" = "full",
+ ): Promise<SessionInfo[]> {
+ 	const sessions: SessionInfo[] = [];
+ 	if (!existsSync(dir)) {
+@@ -727,10 +903,15 @@ async function listSessionsFromDir(
+ 		const total = progressTotal ?? files.length;
+ 
+ 		let loaded = 0;
+-		const results = await buildSessionInfosWithConcurrency(files, () => {
+-			loaded++;
+-			onProgress?.(progressOffset + loaded, total);
+-		});
++		const results = await buildSessionInfosWithConcurrency(
++			files,
++			() => {
++				loaded++;
++				onProgress?.(progressOffset + loaded, total);
++			},
++			mode === "fast" ? buildFastSessionInfo : buildSessionInfo,
++			mode === "fast" ? MAX_CONCURRENT_FAST_SESSION_INFO_LOADS : MAX_CONCURRENT_SESSION_INFO_LOADS,
++		);
+ 		for (const info of results) {
+ 			if (info) {
+ 				sessions.push(info);
+@@ -1515,7 +1696,7 @@ export class SessionManager {
+ 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
+ 		const progress = typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress : onProgress;
+ 		if (customSessionDir) {
+-			const sessions = await listSessionsFromDir(customSessionDir, progress);
++			const sessions = await listSessionsFromDir(customSessionDir, progress, 0, undefined, "fast");
+ 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+ 			return sessions;
+ 		}
+@@ -1547,10 +1728,15 @@ export class SessionManager {
+ 			const sessions: SessionInfo[] = [];
+ 			const allFiles = dirFiles.flat();
+ 
+-			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
+-				loaded++;
+-				progress?.(loaded, totalFiles);
+-			});
++			const results = await buildSessionInfosWithConcurrency(
++				allFiles,
++				() => {
++					loaded++;
++					progress?.(loaded, totalFiles);
++				},
++				buildFastSessionInfo,
++				MAX_CONCURRENT_FAST_SESSION_INFO_LOADS,
++			);
+ 
+ 			for (const info of results) {
+ 				if (info) {
+diff --git a/packages/coding-agent/src/modes/interactive/components/session-selector.ts b/packages/coding-agent/src/modes/interactive/components/session-selector.ts
+index 74141e5e..36e6b289 100644
+--- a/packages/coding-agent/src/modes/interactive/components/session-selector.ts
++++ b/packages/coding-agent/src/modes/interactive/components/session-selector.ts
+@@ -449,7 +449,7 @@ class SessionList implements Component, Focusable {
+ 
+ 			// Right side: message count and age
+ 			const age = formatSessionDate(session.modified);
+-			const msgCount = String(session.messageCount);
++			const msgCount = session.messageCount >= 0 ? String(session.messageCount) : "?";
+ 			let rightPart = `${msgCount} ${age}`;
+ 			if (this.showCwd && session.cwd) {
+ 				rightPart = `${shortenPath(session.cwd)} ${rightPart}`;

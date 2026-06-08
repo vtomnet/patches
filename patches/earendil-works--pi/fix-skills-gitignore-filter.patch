@@ -1,0 +1,28 @@
+diff --git a/packages/coding-agent/src/core/package-manager.ts b/packages/coding-agent/src/core/package-manager.ts
+index 1d7dc27d..25d395e5 100644
+--- a/packages/coding-agent/src/core/package-manager.ts
++++ b/packages/coding-agent/src/core/package-manager.ts
+@@ -358,8 +358,7 @@ function collectSkillEntries(
+ 				}
+ 			}
+ 
+-			const relPath = toPosixPath(relative(root, fullPath));
+-			if (isFile && !ig.ignores(relPath)) {
++			if (isFile) {
+ 				entries.push(fullPath);
+ 				return entries;
+ 			}
+diff --git a/packages/coding-agent/src/core/skills.ts b/packages/coding-agent/src/core/skills.ts
+index c104c856..3470b82c 100644
+--- a/packages/coding-agent/src/core/skills.ts
++++ b/packages/coding-agent/src/core/skills.ts
+@@ -207,8 +207,7 @@ function loadSkillsFromDirInternal(
+ 				}
+ 			}
+ 
+-			const relPath = toPosixPath(relative(root, fullPath));
+-			if (!isFile || ig.ignores(relPath)) {
++			if (!isFile) {
+ 				continue;
+ 			}
+ 

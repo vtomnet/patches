@@ -1,0 +1,39 @@
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -1816,8 +1816,15 @@
+ 			return false;
+ 		}
+ 
+-		// Case 1: Overflow - LLM returned context overflow error
++		// Case 1: Overflow - LLM returned context overflow error, or reported
++		// successful output after accepting an over-window context. Only the
++		// error case needs a retry; successful output is already a completed turn.
+ 		if (sameModel && isContextOverflow(assistantMessage, contextWindow)) {
++			const shouldRetry = assistantMessage.stopReason === "error";
++			if (!shouldRetry) {
++				return await this._runAutoCompaction("overflow", false);
++			}
++
+ 			if (this._overflowRecoveryAttempted) {
+ 				this._emit({
+ 					type: "compaction_end",
+@@ -1832,12 +1839,17 @@
+ 			}
+ 
+ 			this._overflowRecoveryAttempted = true;
+-			// Remove the error message from agent state (it IS saved to session for history,
+-			// but we don't want it in context for the retry)
++			// Remove the overflow response from the retry context. It remains saved in
++			// session history, but the current branch moves back before compaction so
++			// buildSessionContext() does not reintroduce it.
+ 			const messages = this.agent.state.messages;
+ 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+ 				this.agent.state.messages = messages.slice(0, -1);
+ 			}
++			const leafEntry = this.sessionManager.getLeafEntry();
++			if (leafEntry?.type === "message" && leafEntry.message === assistantMessage && leafEntry.parentId !== null) {
++				this.sessionManager.branch(leafEntry.parentId);
++			}
+ 			return await this._runAutoCompaction("overflow", true);
+ 		}
+ 
