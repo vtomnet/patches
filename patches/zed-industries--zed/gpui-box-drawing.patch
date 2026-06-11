@@ -1,0 +1,622 @@
+diff --git a/crates/gpui/src/text_system.rs b/crates/gpui/src/text_system.rs
+index 043d37f679..3a4ef40703 100644
+--- a/crates/gpui/src/text_system.rs
++++ b/crates/gpui/src/text_system.rs
+@@ -1,3 +1,4 @@
++mod box_char;
+ mod font_fallbacks;
+ mod font_features;
+ mod line;
+diff --git a/crates/gpui/src/text_system/box_char.rs b/crates/gpui/src/text_system/box_char.rs
+new file mode 100644
+index 0000000000..10cc798d8a
+--- /dev/null
++++ b/crates/gpui/src/text_system/box_char.rs
+@@ -0,0 +1,543 @@
++use crate::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, fill, point, px};
++use gpui_util::ResultExt;
++
++pub(crate) fn is_box_char(ch: char) -> bool {
++    matches!(ch as u32, 0x2500..=0x259F)
++}
++
++/// Box-drawing and block-element characters must tile seamlessly with their
++/// neighbors, which font glyphs cannot do: they are antialiased sprites cropped
++/// to ink bounds and composited at fractional pixel positions, leaving seams
++/// between cells and never spanning the full line height. Instead we synthesize
++/// these characters as primitives that exactly fill the cell, with all edges
++/// computed in device pixels and rounded, so edges shared between neighboring
++/// cells round identically.
++pub(crate) fn paint_box_char(
++    ch: char,
++    cell: Bounds<Pixels>,
++    font_size: Pixels,
++    color: Hsla,
++    window: &mut Window,
++) {
++    let scale = window.scale_factor();
++    let light = (font_size.0 * scale * 0.08).round().max(1.);
++    BoxCharPainter {
++        left: (cell.left().0 * scale).round(),
++        top: (cell.top().0 * scale).round(),
++        right: (cell.right().0 * scale).round(),
++        bottom: (cell.bottom().0 * scale).round(),
++        light,
++        heavy: light * 2.,
++        scale,
++        color,
++        window,
++    }
++    .paint(ch as u32)
++}
++
++// Arm weights for U+2500..=U+257F, generated from the Unicode character names:
++// bits 0-1 up, 2-3 right, 4-5 down, 6-7 left (0 none, 1 light, 2 heavy),
++// bits 8-10 dash count. Doubles, arcs, and diagonals are matched before this
++// table is consulted, so their entries are zero.
++const ARMS: [u16; 0x80] = [
++    0x044, // U+2500 ─
++    0x088, // U+2501 ━
++    0x011, // U+2502 │
++    0x022, // U+2503 ┃
++    0x344, // U+2504 ┄
++    0x388, // U+2505 ┅
++    0x311, // U+2506 ┆
++    0x322, // U+2507 ┇
++    0x444, // U+2508 ┈
++    0x488, // U+2509 ┉
++    0x411, // U+250A ┊
++    0x422, // U+250B ┋
++    0x014, // U+250C ┌
++    0x018, // U+250D ┍
++    0x024, // U+250E ┎
++    0x028, // U+250F ┏
++    0x050, // U+2510 ┐
++    0x090, // U+2511 ┑
++    0x060, // U+2512 ┒
++    0x0a0, // U+2513 ┓
++    0x005, // U+2514 └
++    0x009, // U+2515 ┕
++    0x006, // U+2516 ┖
++    0x00a, // U+2517 ┗
++    0x041, // U+2518 ┘
++    0x081, // U+2519 ┙
++    0x042, // U+251A ┚
++    0x082, // U+251B ┛
++    0x015, // U+251C ├
++    0x019, // U+251D ┝
++    0x016, // U+251E ┞
++    0x025, // U+251F ┟
++    0x026, // U+2520 ┠
++    0x01a, // U+2521 ┡
++    0x029, // U+2522 ┢
++    0x02a, // U+2523 ┣
++    0x051, // U+2524 ┤
++    0x091, // U+2525 ┥
++    0x052, // U+2526 ┦
++    0x061, // U+2527 ┧
++    0x062, // U+2528 ┨
++    0x092, // U+2529 ┩
++    0x0a1, // U+252A ┪
++    0x0a2, // U+252B ┫
++    0x054, // U+252C ┬
++    0x094, // U+252D ┭
++    0x058, // U+252E ┮
++    0x098, // U+252F ┯
++    0x064, // U+2530 ┰
++    0x0a4, // U+2531 ┱
++    0x068, // U+2532 ┲
++    0x0a8, // U+2533 ┳
++    0x045, // U+2534 ┴
++    0x085, // U+2535 ┵
++    0x049, // U+2536 ┶
++    0x089, // U+2537 ┷
++    0x046, // U+2538 ┸
++    0x086, // U+2539 ┹
++    0x04a, // U+253A ┺
++    0x08a, // U+253B ┻
++    0x055, // U+253C ┼
++    0x095, // U+253D ┽
++    0x059, // U+253E ┾
++    0x099, // U+253F ┿
++    0x056, // U+2540 ╀
++    0x065, // U+2541 ╁
++    0x066, // U+2542 ╂
++    0x096, // U+2543 ╃
++    0x05a, // U+2544 ╄
++    0x0a5, // U+2545 ╅
++    0x069, // U+2546 ╆
++    0x09a, // U+2547 ╇
++    0x0a9, // U+2548 ╈
++    0x0a6, // U+2549 ╉
++    0x06a, // U+254A ╊
++    0x0aa, // U+254B ╋
++    0x244, // U+254C ╌
++    0x288, // U+254D ╍
++    0x211, // U+254E ╎
++    0x222, // U+254F ╏
++    0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, // U+2550..=U+2557
++    0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, // U+2558..=U+255F
++    0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, // U+2560..=U+2567
++    0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, // U+2568..=U+256F
++    0x000, 0x000, 0x000, 0x000, // U+2570..=U+2573
++    0x040, // U+2574 ╴
++    0x001, // U+2575 ╵
++    0x004, // U+2576 ╶
++    0x010, // U+2577 ╷
++    0x080, // U+2578 ╸
++    0x002, // U+2579 ╹
++    0x008, // U+257A ╺
++    0x020, // U+257B ╻
++    0x048, // U+257C ╼
++    0x021, // U+257D ╽
++    0x084, // U+257E ╾
++    0x012, // U+257F ╿
++];
++
++// All coordinates are in device pixels; `logical` converts back for painting.
++struct BoxCharPainter<'a> {
++    left: f32,
++    top: f32,
++    right: f32,
++    bottom: f32,
++    light: f32,
++    heavy: f32,
++    scale: f32,
++    color: Hsla,
++    window: &'a mut Window,
++}
++
++impl BoxCharPainter<'_> {
++    fn paint(&mut self, codepoint: u32) {
++        match codepoint {
++            0x2500..=0x254F | 0x2574..=0x257F => self.arms(ARMS[(codepoint - 0x2500) as usize]),
++            0x2550..=0x256C => self.double(codepoint),
++            0x256D => self.arc(1., 1.),
++            0x256E => self.arc(-1., 1.),
++            0x256F => self.arc(-1., -1.),
++            0x2570 => self.arc(1., -1.),
++            0x2571 => self.diagonals(true, false),
++            0x2572 => self.diagonals(false, true),
++            0x2573 => self.diagonals(true, true),
++            0x2580 => {
++                let edge = self.fy(4);
++                self.rect(self.left, self.top, self.right, edge);
++            }
++            0x2581..=0x2588 => {
++                let edge = self.fy(8 - (codepoint - 0x2580)).min(self.bottom - 1.);
++                self.rect(self.left, edge, self.right, self.bottom);
++            }
++            0x2589..=0x258F => {
++                let edge = self.fx(0x2590 - codepoint).max(self.left + 1.);
++                self.rect(self.left, self.top, edge, self.bottom);
++            }
++            0x2590 => {
++                let edge = self.fx(4);
++                self.rect(edge, self.top, self.right, self.bottom);
++            }
++            0x2591 => self.shade(0.25),
++            0x2592 => self.shade(0.5),
++            0x2593 => self.shade(0.75),
++            0x2594 => {
++                let edge = self.fy(1).max(self.top + 1.);
++                self.rect(self.left, self.top, self.right, edge);
++            }
++            0x2595 => {
++                let edge = self.fx(7).min(self.right - 1.);
++                self.rect(edge, self.top, self.right, self.bottom);
++            }
++            0x2596..=0x259F => {
++                // bits: 1 upper-left, 2 upper-right, 4 lower-left, 8 lower-right
++                const QUADRANTS: [u8; 10] = [
++                    0b0100, 0b1000, 0b0001, 0b1101, 0b1001, 0b0111, 0b1011, 0b0010, 0b0110, 0b1110,
++                ];
++                let mask = QUADRANTS[(codepoint - 0x2596) as usize];
++                let mid_x = self.fx(4);
++                let mid_y = self.fy(4);
++                if mask & 1 != 0 {
++                    self.rect(self.left, self.top, mid_x, mid_y);
++                }
++                if mask & 2 != 0 {
++                    self.rect(mid_x, self.top, self.right, mid_y);
++                }
++                if mask & 4 != 0 {
++                    self.rect(self.left, mid_y, mid_x, self.bottom);
++                }
++                if mask & 8 != 0 {
++                    self.rect(mid_x, mid_y, self.right, self.bottom);
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
++        if x1 <= x0 || y1 <= y0 {
++            return;
++        }
++        let bounds = Bounds::from_corners(self.logical(x0, y0), self.logical(x1, y1));
++        let color = self.color;
++        self.window.paint_quad(fill(bounds, color));
++    }
++
++    fn shade(&mut self, opacity: f32) {
++        let bounds = Bounds::from_corners(
++            self.logical(self.left, self.top),
++            self.logical(self.right, self.bottom),
++        );
++        let color = self.color.opacity(opacity);
++        self.window.paint_quad(fill(bounds, color));
++    }
++
++    fn logical(&self, x: f32, y: f32) -> Point<Pixels> {
++        point(px(x / self.scale), px(y / self.scale))
++    }
++
++    /// Horizontal span of a vertical stroke `width` thick, centered in the
++    /// cell. Rounded once so all rows of a column place the stroke identically.
++    fn vspan(&self, width: f32) -> (f32, f32) {
++        let x0 = ((self.left + self.right) / 2. - width / 2.).round();
++        (x0, x0 + width)
++    }
++
++    fn hspan(&self, width: f32) -> (f32, f32) {
++        let y0 = ((self.top + self.bottom) / 2. - width / 2.).round();
++        (y0, y0 + width)
++    }
++
++    /// X coordinate `eighths`/8 of the way across the cell.
++    fn fx(&self, eighths: u32) -> f32 {
++        (self.left + (self.right - self.left) * eighths as f32 / 8.).round()
++    }
++
++    fn fy(&self, eighths: u32) -> f32 {
++        (self.top + (self.bottom - self.top) * eighths as f32 / 8.).round()
++    }
++
++    fn arms(&mut self, spec: u16) {
++        let weight = |bits: u16| match bits & 3 {
++            1 => self.light,
++            2 => self.heavy,
++            _ => 0.,
++        };
++        let (up, right, down, left) =
++            (weight(spec), weight(spec >> 2), weight(spec >> 4), weight(spec >> 6));
++        let dashes = (spec >> 8) as u32;
++
++        if up == 0. && down == 0. && left == right {
++            let (y0, y1) = self.hspan(left);
++            return self.dashed(self.left, self.right, dashes, |this, a, b| {
++                this.rect(a, y0, b, y1)
++            });
++        }
++        if left == 0. && right == 0. && up == down {
++            let (x0, x1) = self.vspan(up);
++            return self.dashed(self.top, self.bottom, dashes, |this, a, b| {
++                this.rect(x0, a, x1, b)
++            });
++        }
++
++        // Each arm runs from its edge to just past the cell center, far enough
++        // to fuse with perpendicular arms regardless of their weights.
++        let widest = up.max(down).max(left).max(right);
++        let (center_x0, center_x1) = self.vspan(widest);
++        let (center_y0, center_y1) = self.hspan(widest);
++        if up > 0. {
++            let (x0, x1) = self.vspan(up);
++            self.rect(x0, self.top, x1, center_y1);
++        }
++        if down > 0. {
++            let (x0, x1) = self.vspan(down);
++            self.rect(x0, center_y0, x1, self.bottom);
++        }
++        if left > 0. {
++            let (y0, y1) = self.hspan(left);
++            self.rect(self.left, y0, center_x1, y1);
++        }
++        if right > 0. {
++            let (y0, y1) = self.hspan(right);
++            self.rect(center_x0, y0, self.right, y1);
++        }
++    }
++
++    fn dashed(&mut self, from: f32, to: f32, dashes: u32, mut draw: impl FnMut(&mut Self, f32, f32)) {
++        if dashes == 0 {
++            return draw(self, from, to);
++        }
++        let segment = (to - from) / dashes as f32;
++        let gap = (segment / 3.).max(1.);
++        for i in 0..dashes {
++            let start = from + segment * i as f32;
++            draw(
++                self,
++                (start + gap / 2.).round(),
++                (start + segment - gap / 2.).round(),
++            );
++        }
++    }
++
++    fn double(&mut self, codepoint: u32) {
++        let lw = self.light;
++        let (l, t, r, b) = (self.left, self.top, self.right, self.bottom);
++        // The two parallel strokes of a double line, one stroke-width apart.
++        let xa0 = ((l + r) / 2. - 1.5 * lw).round();
++        let (xa1, xb0, xb1) = (xa0 + lw, xa0 + 2. * lw, xa0 + 3. * lw);
++        let ya0 = ((t + b) / 2. - 1.5 * lw).round();
++        let (ya1, yb0, yb1) = (ya0 + lw, ya0 + 2. * lw, ya0 + 3. * lw);
++        // Single-stroke counterpart, for the mixed single/double characters.
++        let (vx0, vx1) = self.vspan(lw);
++        let (hy0, hy1) = self.hspan(lw);
++        match codepoint {
++            0x2550 => {
++                self.rect(l, ya0, r, ya1);
++                self.rect(l, yb0, r, yb1);
++            }
++            0x2551 => {
++                self.rect(xa0, t, xa1, b);
++                self.rect(xb0, t, xb1, b);
++            }
++            0x2552 => {
++                self.rect(vx0, ya0, r, ya1);
++                self.rect(vx0, yb0, r, yb1);
++                self.rect(vx0, ya0, vx1, b);
++            }
++            0x2553 => {
++                self.rect(xa0, hy0, r, hy1);
++                self.rect(xa0, hy0, xa1, b);
++                self.rect(xb0, hy0, xb1, b);
++            }
++            0x2554 => {
++                self.rect(xa0, ya0, r, ya1);
++                self.rect(xb0, yb0, r, yb1);
++                self.rect(xa0, ya0, xa1, b);
++                self.rect(xb0, yb0, xb1, b);
++            }
++            0x2555 => {
++                self.rect(l, ya0, vx1, ya1);
++                self.rect(l, yb0, vx1, yb1);
++                self.rect(vx0, ya0, vx1, b);
++            }
++            0x2556 => {
++                self.rect(l, hy0, xb1, hy1);
++                self.rect(xa0, hy0, xa1, b);
++                self.rect(xb0, hy0, xb1, b);
++            }
++            0x2557 => {
++                self.rect(l, ya0, xb1, ya1);
++                self.rect(l, yb0, xa1, yb1);
++                self.rect(xb0, ya0, xb1, b);
++                self.rect(xa0, yb0, xa1, b);
++            }
++            0x2558 => {
++                self.rect(vx0, ya0, r, ya1);
++                self.rect(vx0, yb0, r, yb1);
++                self.rect(vx0, t, vx1, yb1);
++            }
++            0x2559 => {
++                self.rect(xa0, hy0, r, hy1);
++                self.rect(xa0, t, xa1, hy1);
++                self.rect(xb0, t, xb1, hy1);
++            }
++            0x255A => {
++                self.rect(xb0, ya0, r, ya1);
++                self.rect(xa0, yb0, r, yb1);
++                self.rect(xb0, t, xb1, ya1);
++                self.rect(xa0, t, xa1, yb1);
++            }
++            0x255B => {
++                self.rect(l, ya0, vx1, ya1);
++                self.rect(l, yb0, vx1, yb1);
++                self.rect(vx0, t, vx1, yb1);
++            }
++            0x255C => {
++                self.rect(l, hy0, xb1, hy1);
++                self.rect(xa0, t, xa1, hy1);
++                self.rect(xb0, t, xb1, hy1);
++            }
++            0x255D => {
++                self.rect(l, ya0, xa1, ya1);
++                self.rect(l, yb0, xb1, yb1);
++                self.rect(xa0, t, xa1, ya1);
++                self.rect(xb0, t, xb1, yb1);
++            }
++            0x255E => {
++                self.rect(vx0, t, vx1, b);
++                self.rect(vx0, ya0, r, ya1);
++                self.rect(vx0, yb0, r, yb1);
++            }
++            0x255F => {
++                self.rect(xa0, t, xa1, b);
++                self.rect(xb0, t, xb1, b);
++                self.rect(xb0, hy0, r, hy1);
++            }
++            0x2560 => {
++                self.rect(xa0, t, xa1, b);
++                self.rect(xb0, t, xb1, ya1);
++                self.rect(xb0, yb0, xb1, b);
++                self.rect(xb0, ya0, r, ya1);
++                self.rect(xb0, yb0, r, yb1);
++            }
++            0x2561 => {
++                self.rect(vx0, t, vx1, b);
++                self.rect(l, ya0, vx1, ya1);
++                self.rect(l, yb0, vx1, yb1);
++            }
++            0x2562 => {
++                self.rect(xa0, t, xa1, b);
++                self.rect(xb0, t, xb1, b);
++                self.rect(l, hy0, xa1, hy1);
++            }
++            0x2563 => {
++                self.rect(xb0, t, xb1, b);
++                self.rect(xa0, t, xa1, ya1);
++                self.rect(xa0, yb0, xa1, b);
++                self.rect(l, ya0, xa1, ya1);
++                self.rect(l, yb0, xa1, yb1);
++            }
++            0x2564 => {
++                self.rect(l, ya0, r, ya1);
++                self.rect(l, yb0, r, yb1);
++                self.rect(vx0, yb0, vx1, b);
++            }
++            0x2565 => {
++                self.rect(l, hy0, r, hy1);
++                self.rect(xa0, hy0, xa1, b);
++                self.rect(xb0, hy0, xb1, b);
++            }
++            0x2566 => {
++                self.rect(l, ya0, r, ya1);
++                self.rect(l, yb0, xa1, yb1);
++                self.rect(xb0, yb0, r, yb1);
++                self.rect(xa0, yb0, xa1, b);
++                self.rect(xb0, yb0, xb1, b);
++            }
++            0x2567 => {
++                self.rect(l, ya0, r, ya1);
++                self.rect(l, yb0, r, yb1);
++                self.rect(vx0, t, vx1, ya1);
++            }
++            0x2568 => {
++                self.rect(l, hy0, r, hy1);
++                self.rect(xa0, t, xa1, hy1);
++                self.rect(xb0, t, xb1, hy1);
++            }
++            0x2569 => {
++                self.rect(l, yb0, r, yb1);
++                self.rect(l, ya0, xa1, ya1);
++                self.rect(xb0, ya0, r, ya1);
++                self.rect(xa0, t, xa1, ya1);
++                self.rect(xb0, t, xb1, ya1);
++            }
++            0x256A => {
++                self.rect(l, ya0, r, ya1);
++                self.rect(l, yb0, r, yb1);
++                self.rect(vx0, t, vx1, b);
++            }
++            0x256B => {
++                self.rect(xa0, t, xa1, b);
++                self.rect(xb0, t, xb1, b);
++                self.rect(l, hy0, r, hy1);
++            }
++            0x256C => {
++                self.rect(l, ya0, xa1, ya1);
++                self.rect(xb0, ya0, r, ya1);
++                self.rect(l, yb0, xa1, yb1);
++                self.rect(xb0, yb0, r, yb1);
++                self.rect(xa0, t, xa1, ya1);
++                self.rect(xb0, t, xb1, ya1);
++                self.rect(xa0, yb0, xa1, b);
++                self.rect(xb0, yb0, xb1, b);
++            }
++            _ => {}
++        }
++    }
++
++    /// Rounded corner: a quarter arc joining the midpoint of one vertical cell
++    /// edge to the midpoint of one horizontal cell edge. `sx`/`sy` are +1 for
++    /// the right/bottom edge and -1 for the left/top edge.
++    fn arc(&mut self, sx: f32, sy: f32) {
++        let (vx0, vx1) = self.vspan(self.light);
++        let (hy0, hy1) = self.hspan(self.light);
++        let center_x = (vx0 + vx1) / 2.;
++        let center_y = (hy0 + hy1) / 2.;
++        let edge_x = if sx > 0. { self.right } else { self.left };
++        let edge_y = if sy > 0. { self.bottom } else { self.top };
++        let radius = ((edge_x - center_x) * sx).min((edge_y - center_y) * sy);
++        let mut builder = PathBuilder::stroke(px(self.light / self.scale));
++        builder.move_to(self.logical(center_x, edge_y));
++        builder.line_to(self.logical(center_x, center_y + sy * radius));
++        builder.arc_to(
++            point(px(radius / self.scale), px(radius / self.scale)),
++            px(0.),
++            false,
++            sx * sy > 0.,
++            self.logical(center_x + sx * radius, center_y),
++        );
++        builder.line_to(self.logical(edge_x, center_y));
++        self.paint_builder(builder);
++    }
++
++    fn diagonals(&mut self, rising: bool, falling: bool) {
++        let mut builder = PathBuilder::stroke(px(self.light / self.scale));
++        if rising {
++            builder.move_to(self.logical(self.left, self.bottom));
++            builder.line_to(self.logical(self.right, self.top));
++        }
++        if falling {
++            builder.move_to(self.logical(self.left, self.top));
++            builder.line_to(self.logical(self.right, self.bottom));
++        }
++        self.paint_builder(builder);
++    }
++
++    fn paint_builder(&mut self, builder: PathBuilder) {
++        if let Some(path) = builder.build().log_err() {
++            self.window.paint_path(path, self.color);
++        }
++    }
++}
+diff --git a/crates/gpui/src/text_system/line.rs b/crates/gpui/src/text_system/line.rs
+index cb66359206..f18e46316c 100644
+--- a/crates/gpui/src/text_system/line.rs
++++ b/crates/gpui/src/text_system/line.rs
+@@ -1,3 +1,4 @@
++use super::box_char::{is_box_char, paint_box_char};
+ use crate::{
+     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
+     ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
+@@ -97,6 +98,7 @@ impl ShapedLine {
+             align_width,
+             &self.decoration_runs,
+             &[],
++            &self.text,
+             window,
+             cx,
+         )?;
+@@ -293,6 +295,7 @@ impl WrappedLine {
+             align_width,
+             &self.decoration_runs,
+             &self.wrap_boundaries,
++            &self.text,
+             window,
+             cx,
+         )?;
+@@ -339,6 +342,7 @@ fn paint_line(
+     align_width: Option<Pixels>,
+     decoration_runs: &[DecorationRun],
+     wrap_boundaries: &[WrapBoundary],
++    text: &str,
+     window: &mut Window,
+     cx: &mut App,
+ ) -> Result<()> {
+@@ -524,7 +528,29 @@ fn paint_line(
+                 let content_mask = window.content_mask();
+                 if max_glyph_bounds.intersects(&content_mask.bounds) {
+                     let vertical_offset = point(px(0.0), glyph.position.y);
+-                    if glyph.is_emoji {
++                    if let Some(box_char) = text
++                        .get(glyph.index..)
++                        .and_then(|text| text.chars().next())
++                        .filter(|ch| is_box_char(*ch))
++                    {
++                        let next_x = run
++                            .glyphs
++                            .get(glyph_ix + 1)
++                            .map(|next| next.position.x)
++                            .or_else(|| {
++                                layout
++                                    .runs
++                                    .get(run_ix + 1)
++                                    .and_then(|next_run| next_run.glyphs.first())
++                                    .map(|next| next.position.x)
++                            })
++                            .unwrap_or(layout.width);
++                        let cell = Bounds::new(
++                            glyph_origin,
++                            size(next_x - glyph.position.x, line_height),
++                        );
++                        paint_box_char(box_char, cell, layout.font_size, color, window);
++                    } else if glyph.is_emoji {
+                         window.paint_emoji(
+                             glyph_origin + baseline_offset + vertical_offset,
+                             run.font_id,

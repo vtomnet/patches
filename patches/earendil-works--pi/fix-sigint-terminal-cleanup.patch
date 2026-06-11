@@ -1,0 +1,261 @@
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 5e0ecaf9..6c803b65 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -3309,11 +3309,11 @@ export class InteractiveMode {
+ 	 * repaint the final frame while the process is exiting.
+ 	 */
+ 	private isShuttingDown = false;
++	private suppressSigintShutdown = false;
+ 
+ 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
+ 		if (this.isShuttingDown) return;
+ 		this.isShuttingDown = true;
+-		this.unregisterSignalHandlers();
+ 
+ 		if (options?.fromSignal) {
+ 			// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
+@@ -3397,18 +3397,23 @@ export class InteractiveMode {
+ 	private registerSignalHandlers(): void {
+ 		this.unregisterSignalHandlers();
+ 
+-		const signals: NodeJS.Signals[] = ["SIGTERM"];
++		const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
+ 		if (process.platform !== "win32") {
+ 			signals.push("SIGHUP");
+ 		}
+ 
+ 		for (const signal of signals) {
+ 			const handler = () => {
+-				// SIGHUP no longer hard-exits: graceful shutdown emits session_shutdown
+-				// first, then attempts terminal restore. A genuinely dead terminal
+-				// surfaces as an EIO on the restore writes, which the stdout/stderr
+-				// error handler converts into emergencyTerminalExit (see #4144, #5080).
++				if (signal === "SIGINT" && this.suppressSigintShutdown) return;
+ 				killTrackedDetachedChildren();
++				if (signal === "SIGINT") {
++					void this.shutdown();
++					return;
++				}
++				// SIGHUP/SIGTERM shutdown emits session_shutdown first, then attempts
++				// terminal restore. A genuinely dead terminal surfaces as an EIO on
++				// the restore writes, which the stdout/stderr error handler converts
++				// into emergencyTerminalExit (see #4144, #5080).
+ 				void this.shutdown({ fromSignal: true });
+ 			};
+ 			process.prependListener(signal, handler);
+@@ -3454,6 +3459,7 @@ export class InteractiveMode {
+ 
+ 		// Ignore SIGINT while suspended so Ctrl+C in the terminal does not
+ 		// kill the backgrounded process. The handler is removed on resume.
++		this.suppressSigintShutdown = true;
+ 		const ignoreSigint = () => {};
+ 		process.on("SIGINT", ignoreSigint);
+ 
+@@ -3461,6 +3467,7 @@ export class InteractiveMode {
+ 		process.once("SIGCONT", () => {
+ 			clearInterval(suspendKeepAlive);
+ 			process.removeListener("SIGINT", ignoreSigint);
++			this.suppressSigintShutdown = false;
+ 			this.ui.start();
+ 			this.ui.requestRender(true);
+ 		});
+@@ -3474,6 +3481,7 @@ export class InteractiveMode {
+ 		} catch (error) {
+ 			clearInterval(suspendKeepAlive);
+ 			process.removeListener("SIGINT", ignoreSigint);
++			this.suppressSigintShutdown = false;
+ 			throw error;
+ 		}
+ 	}
+@@ -5656,23 +5664,26 @@ export class InteractiveMode {
+ 	}
+ 
+ 	stop(): void {
+-		this.unregisterSignalHandlers();
+-		if (this.settingsManager.getShowTerminalProgress()) {
+-			this.ui.terminal.setProgress(false);
+-		}
+-		if (this.loadingAnimation) {
+-			this.loadingAnimation.stop();
+-			this.loadingAnimation = undefined;
+-		}
+-		this.clearExtensionTerminalInputListeners();
+-		this.footer.dispose();
+-		this.footerDataProvider.dispose();
+-		if (this.unsubscribe) {
+-			this.unsubscribe();
+-		}
+-		if (this.isInitialized) {
+-			this.ui.stop();
+-			this.isInitialized = false;
++		try {
++			if (this.isInitialized) {
++				this.ui.stop();
++				this.isInitialized = false;
++			}
++		} finally {
++			this.unregisterSignalHandlers();
++			if (this.settingsManager.getShowTerminalProgress()) {
++				this.ui.terminal.setProgress(false);
++			}
++			if (this.loadingAnimation) {
++				this.loadingAnimation.stop();
++				this.loadingAnimation = undefined;
++			}
++			this.clearExtensionTerminalInputListeners();
++			this.footer.dispose();
++			this.footerDataProvider.dispose();
++			if (this.unsubscribe) {
++				this.unsubscribe();
++			}
+ 		}
+ 	}
+ }
+diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
+index 2542286a..0bf4bf0f 100644
+--- a/packages/tui/src/terminal.ts
++++ b/packages/tui/src/terminal.ts
+@@ -404,50 +404,63 @@ export class ProcessTerminal implements Terminal {
+ 	}
+ 
+ 	stop(): void {
+-		if (this.clearProgressInterval()) {
+-			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+-		}
++		const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
++		try {
++			if (this.clearProgressInterval()) {
++				process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
++			}
+ 
+-		// Disable bracketed paste mode
+-		process.stdout.write("\x1b[?2004l");
++			// Restore cursor visibility even when callers stop the terminal directly.
++			process.stdout.write("\x1b[?25h");
+ 
+-		const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
+-		this.clearKeyboardProtocolNegotiationBuffer();
++			// Disable bracketed paste mode
++			process.stdout.write("\x1b[?2004l");
+ 
+-		// Disable Kitty keyboard protocol if not already done by drainInput()
+-		if (shouldDisableKittyProtocol) {
+-			process.stdout.write("\x1b[<u");
+-			this.keyboardProtocolPushed = false;
+-			this._kittyProtocolActive = false;
+-			setKittyProtocolActive(false);
+-		}
+-		this.disableModifyOtherKeys();
++			this.clearKeyboardProtocolNegotiationBuffer();
+ 
+-		// Clean up StdinBuffer
+-		if (this.stdinBuffer) {
+-			this.stdinBuffer.destroy();
+-			this.stdinBuffer = undefined;
+-		}
++			// Disable Kitty keyboard protocol if not already done by drainInput()
++			if (shouldDisableKittyProtocol) {
++				process.stdout.write("\x1b[<u");
++				this.keyboardProtocolPushed = false;
++				this._kittyProtocolActive = false;
++				setKittyProtocolActive(false);
++			}
++			this.disableModifyOtherKeys();
++		} finally {
++			this.clearKeyboardProtocolNegotiationBuffer();
++			if (shouldDisableKittyProtocol) {
++				this.keyboardProtocolPushed = false;
++				this._kittyProtocolActive = false;
++				setKittyProtocolActive(false);
++			}
++			this._modifyOtherKeysActive = false;
+ 
+-		// Remove event handlers
+-		if (this.stdinDataHandler) {
+-			process.stdin.removeListener("data", this.stdinDataHandler);
+-			this.stdinDataHandler = undefined;
+-		}
+-		this.inputHandler = undefined;
+-		if (this.resizeHandler) {
+-			process.stdout.removeListener("resize", this.resizeHandler);
+-			this.resizeHandler = undefined;
+-		}
++			// Clean up StdinBuffer
++			if (this.stdinBuffer) {
++				this.stdinBuffer.destroy();
++				this.stdinBuffer = undefined;
++			}
++
++			// Remove event handlers
++			if (this.stdinDataHandler) {
++				process.stdin.removeListener("data", this.stdinDataHandler);
++				this.stdinDataHandler = undefined;
++			}
++			this.inputHandler = undefined;
++			if (this.resizeHandler) {
++				process.stdout.removeListener("resize", this.resizeHandler);
++				this.resizeHandler = undefined;
++			}
+ 
+-		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
+-		// re-interpreted after raw mode is disabled. This fixes a race condition
+-		// where Ctrl+D could close the parent shell over SSH.
+-		process.stdin.pause();
++			// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
++			// re-interpreted after raw mode is disabled. This fixes a race condition
++			// where Ctrl+D could close the parent shell over SSH.
++			process.stdin.pause();
+ 
+-		// Restore raw mode state
+-		if (process.stdin.setRawMode) {
+-			process.stdin.setRawMode(this.wasRaw);
++			// Restore raw mode state
++			if (process.stdin.setRawMode) {
++				process.stdin.setRawMode(this.wasRaw);
++			}
+ 		}
+ 	}
+ 
+diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
+index f746ee68..b906be6d 100644
+--- a/packages/tui/src/tui.ts
++++ b/packages/tui/src/tui.ts
+@@ -636,20 +636,25 @@ export class TUI extends Container {
+ 			clearTimeout(this.renderTimer);
+ 			this.renderTimer = undefined;
+ 		}
+-		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
+-		if (this.previousLines.length > 0) {
+-			const targetRow = this.previousLines.length; // Line after the last content
+-			const lineDiff = targetRow - this.hardwareCursorRow;
+-			if (lineDiff > 0) {
+-				this.terminal.write(`\x1b[${lineDiff}B`);
+-			} else if (lineDiff < 0) {
+-				this.terminal.write(`\x1b[${-lineDiff}A`);
++		try {
++			// Move cursor to the end of the content to prevent overwriting/artifacts on exit
++			if (this.previousLines.length > 0) {
++				const targetRow = this.previousLines.length; // Line after the last content
++				const lineDiff = targetRow - this.hardwareCursorRow;
++				if (lineDiff > 0) {
++					this.terminal.write(`\x1b[${lineDiff}B`);
++				} else if (lineDiff < 0) {
++					this.terminal.write(`\x1b[${-lineDiff}A`);
++				}
++				this.terminal.write("\r\n");
++			}
++		} finally {
++			try {
++				this.terminal.showCursor();
++			} finally {
++				this.terminal.stop();
+ 			}
+-			this.terminal.write("\r\n");
+ 		}
+-
+-		this.terminal.showCursor();
+-		this.terminal.stop();
+ 	}
+ 
+ 	requestRender(force = false): void {

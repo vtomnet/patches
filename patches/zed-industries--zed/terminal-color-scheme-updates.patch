@@ -1,0 +1,235 @@
+diff --git a/crates/terminal/src/ghostty.rs b/crates/terminal/src/ghostty.rs
+index eb6502537b..f6271e9d65 100644
+--- a/crates/terminal/src/ghostty.rs
++++ b/crates/terminal/src/ghostty.rs
+@@ -18,7 +18,7 @@ use std::{
+     process::ExitStatus,
+     sync::{
+         Arc,
+-        atomic::{AtomicU32, Ordering},
++        atomic::{AtomicU8, AtomicU32, Ordering},
+         mpsc,
+     },
+ };
+@@ -34,7 +34,8 @@ use libghostty_vt::{
+     selection::{FormatOptions, SelectLineOptions, SelectWordOptions, Selection as GhosttySelection},
+     style::{RgbColor, Style, StyleColor},
+     terminal::{
+-        Mode, Point as GhosttyPoint, PointCoordinate, PointSpace, ScrollViewport, SizeReportSize,
++        ColorScheme, Mode, Point as GhosttyPoint, PointCoordinate, PointSpace, ScrollViewport,
++        SizeReportSize,
+     },
+ };
+ use parking_lot::{Mutex, MutexGuard};
+@@ -87,6 +88,7 @@ pub(super) struct GhosttyTermConfig {
+     pub scrolling_history: usize,
+     pub default_cursor_shape: SettingsCursorShape,
+     pub theme: Option<ThemeColors>,
++    pub initial_is_dark: bool,
+ }
+ 
+ pub(super) struct ThemeColors {
+@@ -103,6 +105,7 @@ pub(super) fn display_only_term_config(
+         scrolling_history,
+         default_cursor_shape: cursor_shape,
+         theme: None,
++        initial_is_dark: true,
+     }
+ }
+ 
+@@ -123,6 +126,7 @@ pub(super) fn pty_term_config(
+             foreground: crate::mappings::colors::to_vte_rgb(theme.colors().terminal_foreground),
+             background: crate::mappings::colors::to_vte_rgb(theme.colors().terminal_background),
+         }),
++        initial_is_dark: theme.appearance() == theme::Appearance::Dark,
+     }
+ }
+ 
+@@ -139,6 +143,26 @@ pub(super) fn apply_config(term: &GhosttyTermLock, config: &GhosttyTermConfig) {
+     term.apply_theme(config.theme.as_ref());
+ }
+ 
++/// Update the cached appearance used to answer `CSI ? 996 n` queries, and — if
++/// the appearance changed and the app has subscribed via DEC mode 2031 —
++/// return the `CSI ? 997 ; Ps n` notification bytes the host should write to
++/// the PTY.
++pub(super) fn set_color_scheme(term: &mut GhosttyTerm, is_dark: bool) -> Option<&'static [u8]> {
++    let scheme = if is_dark { 1 } else { 2 };
++    if term.color_scheme.swap(scheme, Ordering::Relaxed) == scheme {
++        return None;
++    }
++    if term.term.mode(Mode::COLOR_SCHEME_REPORT).unwrap_or(false) {
++        Some(if is_dark {
++            b"\x1b[?997;1n"
++        } else {
++            b"\x1b[?997;2n"
++        })
++    } else {
++        None
++    }
++}
++
+ struct CellPx {
+     width: AtomicU32,
+     height: AtomicU32,
+@@ -159,6 +183,7 @@ pub(super) struct GhosttyTerm {
+     cell_iter: CellIterator<'static>,
+     events_tx: UnboundedSender<PtyEvent>,
+     cell_px: Arc<CellPx>,
++    color_scheme: Arc<AtomicU8>, // 1 = dark, 2 = light
+     default_cursor_shape: SettingsCursorShape,
+     selection: Option<TermSelection>,
+     vi_mode: bool,
+@@ -247,6 +272,17 @@ pub(super) fn new_term(
+         }
+     })
+     .ok();
++    let color_scheme = Arc::new(AtomicU8::new(if config.initial_is_dark { 1 } else { 2 }));
++    term.on_color_scheme({
++        let color_scheme = color_scheme.clone();
++        move |_term| {
++            Some(match color_scheme.load(Ordering::Relaxed) {
++                2 => ColorScheme::Light,
++                _ => ColorScheme::Dark,
++            })
++        }
++    })
++    .ok();
+ 
+     term.set_mode(
+         Mode::ALT_SCROLL,
+@@ -261,6 +297,7 @@ pub(super) fn new_term(
+         cell_iter: CellIterator::new().expect("failed to create ghostty cell iterator"),
+         events_tx,
+         cell_px,
++        color_scheme,
+         default_cursor_shape: config.default_cursor_shape,
+         selection: None,
+         vi_mode: false,
+@@ -481,6 +518,7 @@ impl GhosttyTerm {
+ 
+     fn process_bytes(&mut self, bytes: &[u8]) {
+         self.term.vt_write(bytes);
++        self.answer_color_queries(bytes);
+         if let Ok(snapshot) = self.render.update(&self.term) {
+             let blinking = snapshot.cursor_blinking().unwrap_or(false);
+             if blinking != self.last_blink {
+@@ -490,6 +528,42 @@ impl GhosttyTerm {
+         }
+     }
+ 
++    /// libghostty-vt parses OSC color operations but silently drops queries
++    /// (the `.query` branch in stream_terminal.zig is a no-op), so `OSC 10/11 ; ?`
++    /// must be answered here. Apps like nvim and opencode detect light/dark by
++    /// querying OSC 11, re-querying when a mode-2031 notification arrives. The
++    /// scan is chunk-local: a query split across two PTY reads goes unanswered,
++    /// which clients tolerate (they treat these queries as best-effort already).
++    fn answer_color_queries(&mut self, bytes: &[u8]) {
++        let mut rest = bytes;
++        while let Some(position) = rest.windows(2).position(|window| window == b"\x1b]") {
++            let body = &rest[position + 2..];
++            rest = body;
++            let (code, color) = if body.starts_with(b"10;?") {
++                ("10", self.term.fg_color())
++            } else if body.starts_with(b"11;?") {
++                ("11", self.term.bg_color())
++            } else {
++                continue;
++            };
++            let terminator = if body.get(4) == Some(&0x07) {
++                "\x07"
++            } else if body.get(4..6) == Some(b"\x1b\\") {
++                "\x1b\\"
++            } else {
++                continue;
++            };
++            let Ok(Some(color)) = color else { continue };
++            let reply = format!(
++                "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}{terminator}",
++                color.r as u16 * 0x101,
++                color.g as u16 * 0x101,
++                color.b as u16 * 0x101,
++            );
++            send_event(&self.events_tx, TerminalBackendEvent::PtyWrite(reply));
++        }
++    }
++
+     fn apply_theme(&mut self, theme: Option<&ThemeColors>) {
+         let Some(theme) = theme else { return };
+         let palette: [RgbColor; 256] = theme.palette.map(rgb_color_from_vte);
+diff --git a/crates/terminal/src/terminal.rs b/crates/terminal/src/terminal.rs
+index 7e2dd3b2c7..5846e568ab 100644
+--- a/crates/terminal/src/terminal.rs
++++ b/crates/terminal/src/terminal.rs
+@@ -63,10 +63,11 @@ use crate::ghostty::{
+     cursor_blinking, display_offset, display_only_term_config, find_from_terminal_point,
+     full_content_range, last_non_empty_lines, make_content, new_term, open_pty, pty_options,
+     pty_term_config, renderable_cells, resize, screen_lines, scroll_display, scroll_to_point,
+-    search_matches, selection_text, set_default_cursor_style, set_selection as set_term_selection,
+-    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+-    update_selection as update_term_selection, update_selection_to_vi_cursor,
+-    update_vi_cursor_for_scroll, vi_goto_point, vi_motion, write_output as write_output_to_term,
++    search_matches, selection_text, set_color_scheme as set_term_color_scheme,
++    set_default_cursor_style, set_selection as set_term_selection, spawn_event_loop,
++    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
++    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
++    write_output as write_output_to_term,
+ };
+ use crate::mappings::keys::to_esc_str;
+ 
+@@ -1639,6 +1640,26 @@ impl Terminal {
+         apply_config(&self.term, &self.term_config);
+     }
+ 
++    /// Sync the backend's default colors (which answer OSC 4/10/11 queries) to
++    /// the given theme, and notify apps subscribed via DEC mode 2031 when the
++    /// light/dark appearance changed. The colors must be updated before the
++    /// notification is written: consumers (nvim, opencode) react to `997` by
++    /// re-querying OSC 11.
++    pub fn sync_theme(&mut self, theme: &theme::Theme) {
++        if self.term_config.theme.is_some() {
++            self.term_config = pty_term_config(
++                self.term_config.scrolling_history,
++                self.term_config.default_cursor_shape,
++                theme,
++            );
++            apply_config(&self.term, &self.term_config);
++        }
++        let is_dark = theme.appearance() == theme::Appearance::Dark;
++        if let Some(sequence) = set_term_color_scheme(&mut self.term.lock(), is_dark) {
++            self.write_to_pty(sequence);
++        }
++    }
++
+     pub fn write_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+         // Inject bytes directly into the terminal emulator and refresh the UI.
+         // This bypasses the PTY/event loop for display-only terminals.
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 61646d72d7..3bf8feccb8 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -272,6 +272,9 @@ impl TerminalView {
+             focus_out,
+             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
+             cx.observe_global::<SettingsStore>(Self::settings_changed),
++            cx.observe_window_appearance(window, |this, _window, cx| {
++                this.sync_color_scheme(cx);
++            }),
+         ];
+ 
+         Self {
+@@ -556,7 +559,14 @@ impl TerminalView {
+         self.context_menu = Some((context_menu, position, subscription));
+     }
+ 
++    fn sync_color_scheme(&mut self, cx: &mut Context<Self>) {
++        let theme = cx.theme().clone();
++        self.terminal
++            .update(cx, |terminal, _| terminal.sync_theme(&theme));
++    }
++
+     fn settings_changed(&mut self, cx: &mut Context<Self>) {
++        self.sync_color_scheme(cx);
+         let settings = TerminalSettings::get_global(cx);
+         let breadcrumb_visibility_changed = self.show_breadcrumbs != settings.toolbar.breadcrumbs;
+         self.show_breadcrumbs = settings.toolbar.breadcrumbs;
